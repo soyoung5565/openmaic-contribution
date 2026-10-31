@@ -1,0 +1,257 @@
+From 8b4ccfe0e2b0aa310b5044a021fc1b19e844cbdf Mon Sep 17 00:00:00 2001
+From: soyoung5565 <soyoung5565@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 16:06:31 +0800
+Subject: [PATCH] feat: add NVIDIA NIM provider (Kimi K3) + compat &
+ performance fixes
+
+- providers: NVIDIA NIM provider with Kimi K3; muse-spark models use /v1/responses
+- providers: minimax anthropic-compat endpoint requires X-Api-Key header
+- media-gen: parallel TTS generation with bounded concurrency (TTS_CONCURRENCY, default 4)
+- storage: retry atomic rename on Windows (EPERM/EACCES/EBUSY backoff)
+- instrumentation: guard process.on for non-Node SSR runtimes
+- gitignore: local work files
+---
+ .gitignore                               |  6 ++++
+ instrumentation.ts                       |  6 ++--
+ lib/ai/providers.ts                      | 42 +++++++++++++++++++++++-
+ lib/server/classroom-media-generation.ts | 19 +++++++++--
+ lib/server/classroom-storage.ts          | 22 ++++++++++++-
+ lib/server/provider-config.ts            |  1 +
+ lib/types/provider.ts                    |  6 ++--
+ public/logos/nvidia.svg                  |  4 +++
+ 8 files changed, 96 insertions(+), 10 deletions(-)
+ create mode 100644 public/logos/nvidia.svg
+
+diff --git a/.gitignore b/.gitignore
+index 8c097e30..542c64d6 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -90,3 +90,9 @@ e2e/screenshots/
+ # local e2e screenshots for #619 review
+ e2e/__screenshots-619/
+ /.playwright-mcp/
++
++# Local work files
++*.bak-before-*
++.pnpm-install-pid
++openmaic-dev.log
++pnpm-install.log
+diff --git a/instrumentation.ts b/instrumentation.ts
+index 93105157..2e044de0 100644
+--- a/instrumentation.ts
++++ b/instrumentation.ts
+@@ -94,6 +94,8 @@ export async function register(): Promise<void> {
+     return shutdownPromise;
+   };
+ 
+-  process.once('SIGTERM', () => void shutdown());
+-  process.once('SIGINT', () => void shutdown());
++  if (typeof process !== 'undefined' && typeof (process as { on?: unknown }).on === 'function') {
++    process.once('SIGTERM', () => void shutdown());
++    process.once('SIGINT', () => void shutdown());
++  }
+ }
+diff --git a/lib/ai/providers.ts b/lib/ai/providers.ts
+index f2880df6..38e5779a 100644
+--- a/lib/ai/providers.ts
++++ b/lib/ai/providers.ts
+@@ -1548,6 +1548,33 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
+       },
+     ],
+   },
++  'nvidia-nim': {
++    id: 'nvidia-nim',
++    name: 'NVIDIA NIM',
++    type: 'nvidia-nim',
++    defaultBaseUrl: 'https://integrate.api.nvidia.com/v1',
++    requiresApiKey: true,
++    icon: '/logos/nvidia.svg',
++    models: [
++      {
++        id: 'moonshotai/kimi-k3',
++        name: 'Kimi K3 (NVIDIA NIM)',
++        contextWindow: 131072,
++        outputWindow: 8192,
++        capabilities: {
++          streaming: true,
++          tools: false,
++          vision: false,
++          thinking: {
++            toggleable: false,
++            budgetAdjustable: false,
++            defaultEnabled: true,
++          },
++        },
++      },
++    ],
++  },
++
+ };
+ 
+ applyModelMetadata(PROVIDERS);
+@@ -1815,7 +1842,10 @@ function shouldUseOpenAIResponsesApi(providerId: ProviderId, modelId: string): b
+     /^gpt-5\.\d+-pro(?:-|$)/.test(modelId) ||
+     /^gpt-5\.6(?:-|$)/.test(modelId) ||
+     /^gpt-5\.5(?:-|$)/.test(modelId) ||
+-    /^gpt-5\.[3-9]-codex(?:-|$)/.test(modelId)
++    /^gpt-5\.[3-9]-codex(?:-|$)/.test(modelId) ||
++    // opencode-go relay: muse-spark-* must use /v1/responses (codex_responses mode).
++    // /v1/chat/completions returns 500 on the muse endpoint.
++    /^muse-spark(?:-|$)/.test(modelId)
+   );
+ }
+ 
+@@ -2074,6 +2104,7 @@ export function getModel(config: ModelConfig): ModelWithInfo {
+       break;
+     }
+ 
++    case 'nvidia-nim':
+     case 'openai': {
+       const useStreamingChatCompat = shouldUseOpenAIStreamingChatCompat(
+         config.providerId,
+@@ -2240,6 +2271,15 @@ export function getModel(config: ModelConfig): ModelWithInfo {
+             | undefined;
+           const thinking = thinkingCtx?.getStore?.() as ThinkingConfig | undefined;
+ 
++          // minimax anthropic compat endpoint requires X-Api-Key header (not Authorization Bearer).
++          // See skill family-tutor/opencode-provider-troubleshooting/muse-ai-sdk-responses-2026-09-01.md
++          if (init?.headers && effectiveApiKey) {
++            const h = new Headers(init.headers);
++            h.delete('authorization');
++            h.set('x-api-key', effectiveApiKey);
++            init = { ...init, headers: h };
++          }
++
+           if (
+             capability?.requestAdapter === 'anthropic' &&
+             capability.control !== 'none' &&
+diff --git a/lib/server/classroom-media-generation.ts b/lib/server/classroom-media-generation.ts
+index 7a742937..4ea8cccd 100644
+--- a/lib/server/classroom-media-generation.ts
++++ b/lib/server/classroom-media-generation.ts
+@@ -277,6 +277,11 @@ export async function generateTTSForClassroom(
+     return;
+   }
+ 
++  // Collect TTS tasks first (splitting/filtering stay synchronous), then
++  // synthesize with bounded concurrency: serial synthesis dominated lesson
++  // generation time (upstream TTS handles several parallel requests fine).
++  const ttsTasks: Array<{ speechAction: ServerTransportSpeechAction; audioId: string }> = [];
++
+   for (const scene of scenes) {
+     if (!scene.actions) continue;
+ 
+@@ -293,8 +298,15 @@ export async function generateTTSForClassroom(
+       // Server transport emits the derived id plus the serving URL; the
+       // client-side converter collapses the pair into one pool asset on
+       // first load. Browser generation allocates pool ids directly.
+-      const audioId = `tts_s${sceneOrder}_${action.id}`;
++      ttsTasks.push({ speechAction, audioId: `tts_s${sceneOrder}_${action.id}` });
++    }
++  }
+ 
++  const ttsConcurrency = Math.max(1, parseInt(process.env.TTS_CONCURRENCY || '4', 10) || 4);
++  let nextTaskIndex = 0;
++  const worker = async () => {
++    while (nextTaskIndex < ttsTasks.length) {
++      const { speechAction, audioId } = ttsTasks[nextTaskIndex++];
+       try {
+         const result = await generateTTS(
+           {
+@@ -315,8 +327,9 @@ export async function generateTTSForClassroom(
+         speechAction.audioUrl = mediaServingUrl(baseUrl, classroomId, `audio/${filename}`);
+         log.info(`Generated TTS: ${filename} (${result.audio.length} bytes)`);
+       } catch (err) {
+-        log.warn(`TTS generation failed for action ${action.id}:`, err);
++        log.warn(`TTS generation failed for action ${speechAction.id}:`, err);
+       }
+     }
+-  }
++  };
++  await Promise.all(Array.from({ length: Math.min(ttsConcurrency, ttsTasks.length) }, worker));
+ }
+diff --git a/lib/server/classroom-storage.ts b/lib/server/classroom-storage.ts
+index 41e3e8c9..6707fcce 100644
+--- a/lib/server/classroom-storage.ts
++++ b/lib/server/classroom-storage.ts
+@@ -25,7 +25,27 @@ export async function writeJsonFileAtomic(filePath: string, data: unknown) {
+   const tempFilePath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+   const content = JSON.stringify(data, null, 2);
+   await fs.writeFile(tempFilePath, content, 'utf-8');
+-  await fs.rename(tempFilePath, filePath);
++
++  // Windows: the target file may be briefly held by file watchers / AV scans,
++  // making rename intermittently fail with EPERM/EACCES/EBUSY. Retry with backoff.
++  let lastErr: NodeJS.ErrnoException | null = null;
++  for (let attempt = 0; attempt < 8; attempt++) {
++    try {
++      await fs.rename(tempFilePath, filePath);
++      return;
++    } catch (error) {
++      const code = (error as NodeJS.ErrnoException).code;
++      if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw error;
++      lastErr = error as NodeJS.ErrnoException;
++      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
++    }
++  }
++  try {
++    await fs.unlink(tempFilePath);
++  } catch {
++    /* ignore cleanup failure */
++  }
++  throw lastErr;
+ }
+ 
+ export function buildRequestOrigin(req: NextRequest): string {
+diff --git a/lib/server/provider-config.ts b/lib/server/provider-config.ts
+index a75c77ba..582d1890 100644
+--- a/lib/server/provider-config.ts
++++ b/lib/server/provider-config.ts
+@@ -82,6 +82,7 @@ export const LLM_ENV_MAP: Record<string, string> = {
+   OLLAMA: 'ollama',
+   LEMONADE: 'lemonade',
+   BEDROCK: 'bedrock',
++  NVIDIA_NIM: 'nvidia-nim',
+ };
+ 
+ const TTS_ENV_MAP: Record<string, string> = {
+diff --git a/lib/types/provider.ts b/lib/types/provider.ts
+index 65c12cf4..0d7036bd 100644
+--- a/lib/types/provider.ts
++++ b/lib/types/provider.ts
+@@ -24,18 +24,18 @@ export type BuiltInProviderId =
+   | 'tencent-hunyuan'
+   | 'xiaomi'
+   | 'lemonade'
+-  | 'ollama';
++  | 'ollama' | 'nvidia-nim';
+ 
+ /**
+  * Provider ID (built-in or custom)
+  * For custom providers, use string literals prefixed with "custom-"
+  */
+-export type ProviderId = BuiltInProviderId | `custom-${string}`;
++export type ProviderId = BuiltInProviderId | `custom-${string}` | 'nvidia-nim';
+ 
+ /**
+  * Provider API types
+  */
+-export type ProviderType = 'openai' | 'azure' | 'anthropic' | 'bedrock' | 'google';
++export type ProviderType = 'openai' | 'azure' | 'anthropic' | 'bedrock' | 'google' | 'nvidia-nim';
+ 
+ export type ThinkingControlType =
+   | 'none'
+diff --git a/public/logos/nvidia.svg b/public/logos/nvidia.svg
+new file mode 100644
+index 00000000..94f4759b
+--- /dev/null
++++ b/public/logos/nvidia.svg
+@@ -0,0 +1,4 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60">
++  <path d="M50 5 L95 30 L50 55 L5 30 Z" fill="#76B900"/>
++  <path d="M50 15 L80 30 L50 45" fill="none" stroke="white" stroke-width="2"/>
++</svg>
+\ No newline at end of file
+-- 
+2.53.0.windows.3
+
